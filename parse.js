@@ -12,7 +12,15 @@ for (const k in RULES.other) other[k] = new RegExp(RULES.other[k].s, RULES.other
 const BLOCK_TAGS = "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul";
 
 function memoize(fn) { const c = []; return t => { const n = Math.max(0, Math.min(3, t - 1)); return c[n] || (c[n] = fn(n)); }; }
-other.listItemRegex = a => new RegExp("^( {0,3}" + a + ")((?:[\t ][^\\n]*)?(?:\\n|$))");
+// listItemRegex cache keyed by bull — only ~5 distinct bulls exist (\*, \+, \-,
+// \d{1,9}\., \d{1,9}\)), and list() ran on nearly every dash/digit-starting
+// paragraph line, so building a fresh RegExp each time was pure waste.
+const listItemRegexCache = new Map();
+other.listItemRegex = a => {
+  let re = listItemRegexCache.get(a);
+  if (re === undefined) { re = new RegExp("^( {0,3}" + a + ")((?:[\t ][^\\n]*)?(?:\\n|$))"); listItemRegexCache.set(a, re); }
+  return re;
+};
 other.nextBulletRegex = memoize(n => new RegExp("^ {0," + n + "}(?:[*+-]|\\d{1,9}[.)])((?:[ \t][^\\n]*)?(?:\\n|$))"));
 other.hrRegex = memoize(n => new RegExp("^ {0," + n + "}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\\*[ \t]*){3,})(?:\\n+|$)"));
 other.fencesBeginRegex = memoize(n => new RegExp("^ {0," + n + "}(?:```|~~~)"));
@@ -359,6 +367,23 @@ class Tokenizer {
   }
 
   list(src) {
+    // fast reject (sound: block.list's first line is ^bull([ \t][^\n]*?)?(?:\n|$),
+    // so a marker NOT followed by space/tab/newline/EOS can never start a list)
+    let fi = 0;
+    while (fi < 3 && src.charCodeAt(fi) === 32) fi++;
+    let fc = src.charCodeAt(fi);
+    if (fc >= 48 && fc <= 57) {
+      let fj = fi + 1;
+      while (fj < src.length && (fc = src.charCodeAt(fj)) >= 48 && fc <= 57) fj++;
+      // \d{1,9} greedy: the only length that can be followed by [.)] is the
+      // full digit run, and it must be <= 9 chars
+      if (fj - fi > 9) return;
+      fc = src.charCodeAt(fj);
+      if (fc !== 46 && fc !== 41) return;
+      fi = fj;
+    } else if (fc !== 42 && fc !== 43 && fc !== 45) return;
+    fc = src.charCodeAt(fi + 1);
+    if (!(fc === 32 || fc === 9 || fc === 10) && fi + 1 < src.length) return;
     const t = block.list.exec(src);
     if (!t) return;
     const orig = src;
