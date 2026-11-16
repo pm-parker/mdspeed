@@ -53,6 +53,16 @@ for (let c = 97; c <= 122; c++) if (!URLC0[c]) URLC0[c] = 2;
 for (let c = 65; c <= 90; c++) if (!URLC0[c]) URLC0[c] = 2;
 for (let c = 48; c <= 57; c++) URLC0[c] = 2;
 URLC0[46] = 2; URLC0[95] = 2; URLC0[43] = 2; URLC0[45] = 2;
+// inlineLoop dispatch bitmask per first char: 1=escape(\\) 2=tag/autolink(<)
+// 4=link/reflink([ !) 8=emStrong(* _) 16=codespan(`) 32=br(sp \\) 64=del(~)
+const IDISPATCH = new Uint8Array(128);
+IDISPATCH[92] = 1 | 32;
+IDISPATCH[60] = 2;
+IDISPATCH[91] = 4; IDISPATCH[33] = 4;
+IDISPATCH[42] = 8; IDISPATCH[95] = 8;
+IDISPATCH[96] = 16;
+IDISPATCH[32] = 32;
+IDISPATCH[126] = 64;
 const maskCharRe = /[`\\[<]/;
 
 // ---------- helpers ----------
@@ -179,6 +189,68 @@ function cpFirstLen(s) { const c = s.codePointAt(0); return c > 0xFFFF ? 2 : 1; 
 // first line of a string without allocating an array
 function firstLineOf(s) { const i = s.indexOf("\n"); return i === -1 ? s : s.slice(0, i); }
 
+// charCode replacements for the list() per-line begin-regexes (each is an
+// anchored `^ {0,n}<shape>` rule; n = memoized clamp of the item offset).
+// Exact behavioural clones of nextBulletRegex/hrRegex/fencesBeginRegex/
+// headingBeginRegex/blockquoteBeginRegex .test() on a newline-free line.
+function listBulletAt(line, n) {
+  let i = 0;
+  while (i < n && line.charCodeAt(i) === 32) i++;
+  let c = line.charCodeAt(i);
+  let j;
+  if (c >= 48 && c <= 57) {
+    j = i + 1;
+    while (j < line.length && (c = line.charCodeAt(j)) >= 48 && c <= 57 && j - i < 9) j++;
+    if (c !== 46 && c !== 41) return false;
+    j++;
+  } else {
+    if (c !== 42 && c !== 43 && c !== 45) return false;
+    j = i + 1;
+  }
+  const e = line.charCodeAt(j);
+  return e === 32 || e === 9 || j >= line.length;
+}
+function listHrAt(line, n) {
+  let i = 0;
+  while (i < n && line.charCodeAt(i) === 32) i++;
+  const c = line.charCodeAt(i);
+  if (c !== 45 && c !== 95 && c !== 42) return false;
+  let k = i + 1, cnt = 1;
+  const len = line.length;
+  while (k < len) {
+    const d = line.charCodeAt(k);
+    if (d === c) { cnt++; k++; }
+    else if (d === 32 || d === 9) k++;
+    else return false;
+  }
+  return cnt >= 3;
+}
+function listFencesAt(line, n) {
+  let i = 0;
+  while (i < n && line.charCodeAt(i) === 32) i++;
+  const c = line.charCodeAt(i);
+  if (c !== 96 && c !== 126) return false;
+  return line.charCodeAt(i + 1) === c && line.charCodeAt(i + 2) === c;
+}
+function listHeadingAt(line, n) {
+  let i = 0;
+  while (i < n && line.charCodeAt(i) === 32) i++;
+  if (line.charCodeAt(i) !== 35) return false;
+  let k = i + 1;
+  const len = line.length;
+  while (k < len && line.charCodeAt(k) === 35) k++;
+  if (k - i > 6) return false;
+  if (k >= len) return true;
+  const c = line.charCodeAt(k);
+  return c === 32 || c === 9 || (c >= 9 && c <= 13) || c === 0xA0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200A)
+    || c === 0x2028 || c === 0x2029 || c === 0x202F || c === 0x205F || c === 0x3000 || c === 0xFEFF;
+}
+function listBqAt(line, n) {
+  let i = 0;
+  while (i < n && line.charCodeAt(i) === 32) i++;
+  return line.charCodeAt(i) === 62;
+}
+
 function compareLinks(src, text, maskLen) {
   if (!text.includes("<")) return false;
   for (let i = 0; i < text.length; i++) {
@@ -247,11 +319,25 @@ function findLastCloserRun(a, code) {
 function computeMask(a) {
   return { maskedSrc: a, closer: { "*": findLastCloserRun(a, 42), "_": findLastCloserRun(a, 95) }, delCloser: findLastCloserRun(a, 126) };
 }
-function pushMask(src) { maskStack.push(computeMask(src)); }
-function pushMaskNoEm(src) { maskStack.push({ maskedSrc: src, closer: { "*": -1, "_": -1 }, delCloser: -1 }); }
+void computeMask;
+// lazy closers: most chunks never reach a peek (emStrong early-outs before the
+// closer lookup), so compute each closer run on first use instead of 3x eagerly
+function pushMask(src) { maskStack.push({ maskedSrc: src, c42: null, c95: null, c126: null }); }
+function pushMaskNoEm(src) { maskStack.push({ maskedSrc: src, c42: -1, c95: -1, c126: -1 }); }
 function popMask() { maskStack.pop(); }
-function peekEmCloser(src, ch) { const m = maskStack[maskStack.length - 1]; return m && m.maskedSrc === src ? m.closer[ch] : computeMask(src).closer[ch]; }
-function peekDelCloser(src) { const m = maskStack[maskStack.length - 1]; return m && m.maskedSrc === src ? m.delCloser : computeMask(src).delCloser; }
+function peekEmCloser(src, ch) {
+  const m = maskStack[maskStack.length - 1];
+  if (m && m.maskedSrc === src) {
+    if (ch === "*") return m.c42 !== null ? m.c42 : (m.c42 = findLastCloserRun(src, 42));
+    return m.c95 !== null ? m.c95 : (m.c95 = findLastCloserRun(src, 95));
+  }
+  return findLastCloserRun(src, ch === "*" ? 42 : 95);
+}
+function peekDelCloser(src) {
+  const m = maskStack[maskStack.length - 1];
+  if (m && m.maskedSrc === src) return m.c126 !== null ? m.c126 : (m.c126 = findLastCloserRun(src, 126));
+  return findLastCloserRun(src, 126);
+}
 
 // ---------- tokenizer ----------
 
@@ -420,12 +506,8 @@ class Tokenizer {
         endEarly = true;
       }
       if (!endEarly) {
-        const nextBulletRegex = other.nextBulletRegex(offset);
-        const hrRegex = other.hrRegex(offset);
-        const fencesBeginRegex = other.fencesBeginRegex(offset);
-        const headingBeginRegex = other.headingBeginRegex(offset);
         const htmlBeginRegex = other.htmlBeginRegex(offset);
-        const blockquoteBeginRegex = other.blockquoteBeginRegex(offset);
+        const bn = offset <= 1 ? 0 : offset >= 4 ? 3 : offset - 1; // memoize() clamp
         let cur = spacedFirstLine;
         while (src) {
           const nlIdx = src.indexOf("\n");
@@ -433,17 +515,17 @@ class Tokenizer {
           lineAfter = line;
           const lineC0 = line.charCodeAt(0);
           const spacedLine = (lineC0 === 32 || lineC0 === 9) ? expandLeading(line, 0) : line;
-          // gate the six begin-regexes on the first non-space char (all are
+          // gate the six begin-checks on the first non-space char (all are
           // anchored `^ {0,N}<char>...` rules, so this is semantics-preserving)
           let j = 0;
           while (j < 3 && line.charCodeAt(j) === 32) j++;
           const lc = line.charCodeAt(j);
-          if ((lc === 96 || lc === 126) && fencesBeginRegex.test(line)) break;
-          if (lc === 35 && headingBeginRegex.test(line)) break;
+          if ((lc === 96 || lc === 126) && listFencesAt(line, bn)) break;
+          if (lc === 35 && listHeadingAt(line, bn)) break;
           if (lc === 60 && htmlBeginRegex.test(line)) break;
-          if (lc === 62 && blockquoteBeginRegex.test(line)) break;
-          if ((lc === 42 || lc === 43 || lc === 45 || (lc >= 48 && lc <= 57)) && nextBulletRegex.test(line)) break;
-          if ((lc === 45 || lc === 95 || lc === 42) && hrRegex.test(line)) break;
+          if (lc === 62 && listBqAt(line, bn)) break;
+          if ((lc === 42 || lc === 43 || lc === 45 || (lc >= 48 && lc <= 57)) && listBulletAt(line, bn)) break;
+          if ((lc === 45 || lc === 95 || lc === 42) && listHrAt(line, bn)) break;
           // first index of a non-space char (== spacedLine.search(/[^ ]/), -1 if none)
           let ns = -1;
           for (let q = 0; q < spacedLine.length; q++) { if (spacedLine.charCodeAt(q) !== 32) { ns = q; break; } }
@@ -454,7 +536,7 @@ class Tokenizer {
             const curSpaced = cur.indexOf("\t") === -1 ? cur : cur.replace(other.tabCharGlobal, "    ");
             let cns = -1;
             for (let q = 0; q < curSpaced.length; q++) { if (curSpaced.charCodeAt(q) !== 32) { cns = q; break; } }
-            if (blankFirstLine || cns >= 4 || ((fencesBeginRegex.test(cur) || headingBeginRegex.test(cur) || htmlBeginRegex.test(cur) || hrRegex.test(cur)))) break;
+            if (blankFirstLine || cns >= 4 || (listFencesAt(cur, bn) || listHeadingAt(cur, bn) || htmlBeginRegex.test(cur) || listHrAt(cur, bn))) break;
             const qe = /^ {0,3}(?:=+|-+) *$/.test(lineAfter) && block.lheading.test(cur + "\n" + lineAfter)
               ? "    " + spacedLine.replace(/^ {0,3}/, "")
               : lineAfter;
@@ -670,11 +752,20 @@ class Tokenizer {
     const srcOffset = maskedSrc.length - src.length;
     let l = srcOffset;
     while (l > 0 && maskedSrc[l - 1] === firstChar) l--;
-    const charBeforeRun = cpLast(maskedSrc.slice(Math.max(0, l - 2), l));
-    const isPunctBefore = charBeforeRun === "*" || charBeforeRun === "_" || !!inline.punctuation.exec(charBeforeRun);
+    // == cpLast(maskedSrc.slice(max(0, l - 2), l)) without the slice allocation
+    let charBeforeRun;
+    if (l === 0) charBeforeRun = "";
+    else {
+      const u = maskedSrc.charCodeAt(l - 1);
+      if (u >= 0xDC00 && u <= 0xDFFF && l >= 2) {
+        const h = maskedSrc.charCodeAt(l - 2);
+        charBeforeRun = (h >= 0xD800 && h <= 0xDBFF) ? maskedSrc.slice(l - 2, l) : maskedSrc.charAt(l - 1);
+      } else charBeforeRun = maskedSrc.charAt(l - 1);
+    }
+    const isPunctBefore = charBeforeRun === "*" || charBeforeRun === "_" || !!inline.punctuation.test(charBeforeRun);
     if (l < srcOffset) prevChar = charBeforeRun;
-    const prevCharIsPunct = l < srcOffset ? isPunctBefore : !!inline.punctuation.exec(prevChar);
-    if (lDelim[4] && prevChar.match(other.unicodeAlphaNumeric)) return;
+    const prevCharIsPunct = l < srcOffset ? isPunctBefore : !!inline.punctuation.test(prevChar);
+    if (lDelim[4] && other.unicodeAlphaNumeric.test(prevChar)) return;
     const punctAfter = lDelim[1] || lDelim[3] || "";
     if (!punctAfter || !prevChar || prevCharIsPunct) {
       const k = cpLen(lDelim[0]) - 1;
@@ -975,6 +1066,7 @@ class Lexer {
     let hasAt = -1; // lazily computed: does the source contain "@"
     const tk = this.tokenizer;
     const links = this.tokens.links;
+    const st = this.state;
     while (src) {
       if (src.length < minLen) minLen = src.length;
       else { throw new Error("Infinite loop on byte: " + src.charCodeAt(0)); }
@@ -982,24 +1074,28 @@ class Lexer {
       continueFlag = false;
       const c0 = src.charCodeAt(0);
       let tok;
-      // first-char gates: each rule is anchored with a fixed set of possible
-      // first characters, so skipping on other chars is semantics-preserving.
-      if (c0 === 92 && (tok = tk.escape(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
-      if (c0 === 60 && (tok = tk.tag(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
-      if ((c0 === 91 || c0 === 33) && (tok = tk.link(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
-      if ((c0 === 91 || c0 === 33) && (tok = tk.reflink(src, links))) {
-        src = src.substring(tok.raw.length);
-        const last = tokens[tokens.length - 1];
-        if (tok.type === "text" && last?.type === "text") { last.raw += tok.raw; last.text += tok.text; }
-        else tokens.push(tok);
-        continue;
+      // first-char gates via one bitmask lookup (IDISPATCH): each rule is
+      // anchored with a fixed set of possible first characters, so skipping on
+      // other chars is semantics-preserving; tokenizer order is unchanged.
+      const bits = c0 < 128 ? IDISPATCH[c0] : 0;
+      if (bits !== 0) {
+        if ((bits & 1) && (tok = tk.escape(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
+        if ((bits & 2) && (tok = tk.tag(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
+        if ((bits & 4) && (tok = tk.link(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
+        if ((bits & 4) && (tok = tk.reflink(src, links))) {
+          src = src.substring(tok.raw.length);
+          const last = tokens[tokens.length - 1];
+          if (tok.type === "text" && last?.type === "text") { last.raw += tok.raw; last.text += tok.text; }
+          else tokens.push(tok);
+          continue;
+        }
+        if ((bits & 8) && (tok = tk.emStrong(src, masked, prevChar))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
+        if ((bits & 16) && (tok = tk.codespan(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
+        if ((bits & 32) && (tok = tk.br(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
+        if ((bits & 64) && (tok = tk.del(src, masked, prevChar))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
+        if ((bits & 2) && (tok = tk.autolink(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
       }
-      if ((c0 === 42 || c0 === 95) && (tok = tk.emStrong(src, masked, prevChar))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
-      if (c0 === 96 && (tok = tk.codespan(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
-      if ((c0 === 32 || c0 === 92) && (tok = tk.br(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
-      if (c0 === 126 && (tok = tk.del(src, masked, prevChar))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
-      if (c0 === 60 && (tok = tk.autolink(src))) { src = src.substring(tok.raw.length); tokens.push(tok); continue; }
-      if (!this.state.inLink && URLC0[c0]) {
+      if (!st.inLink && URLC0[c0]) {
         // URLC0[c0]: 1 = protocol/www/mailto/xmpp first char (always try url),
         // 2 = email-local first char (only when an "@" remains ahead)
         if (URLC0[c0] === 1) {
@@ -1011,7 +1107,8 @@ class Lexer {
       }
       if (tok = tk.inlineText(src)) {
         src = src.substring(tok.raw.length);
-        if (tok.raw.slice(-1) !== "_") prevChar = tok.raw.slice(-1);
+        const lc = tok.raw.length ? tok.raw.charAt(tok.raw.length - 1) : "";
+        if (lc !== "_") prevChar = lc;
         continueFlag = true;
         const last = tokens[tokens.length - 1];
         if (last?.type === "text") { last.raw += tok.raw; last.text += tok.text; }
@@ -1049,8 +1146,8 @@ class Lexer {
         return n;
       });
     }
-    // blockSkip can only match a link (...), a code span or an html tag
-    if (hasBacktick || t.includes("[") || t.includes("<")) {
+    // blockSkip can only match a link ([...](...)), a code span or an html tag
+    if (hasBacktick || t.includes("<") || (t.includes("[") && t.includes("("))) {
       t = t.replace(inline.blockSkip, (n, s, r) => {
         const o = r ? r.length : 0;
         return n.slice(0, o) + "[" + "a".repeat(n.length - o - 2) + "]";
